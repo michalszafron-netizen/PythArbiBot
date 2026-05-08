@@ -11,6 +11,7 @@ Or import into aave_main.py for continuous monitoring.
 """
 import asyncio
 import csv
+import json
 import logging
 import os
 import time
@@ -215,7 +216,11 @@ BORROWERS_QUERY = """
 query GetBorrowers($lastId: String!) {
   positions(
     first: 1000
-    where: { side: BORROWER, id_gt: $lastId }
+    where: { 
+      side: BORROWER, 
+      id_gt: $lastId,
+      balance_gt: "0"
+    }
     orderBy: id
     orderDirection: asc
   ) {
@@ -223,17 +228,20 @@ query GetBorrowers($lastId: String!) {
     account {
       id
     }
+    balance
   }
 }
 """
 
 # Query for users with active borrows — we then check HF on-chain
-async def fetch_borrowers_subgraph(session: aiohttp.ClientSession) -> list[str]:
+async def fetch_borrowers_subgraph(session: aiohttp.ClientSession, max_borrowers: int = 12000) -> list[str]:
     """Fetch list of borrower addresses from AAVE subgraph using pagination."""
     addresses = set()
     last_id = ""
     
-    while True:
+    log.info("Subgraph: Fetching active borrowers (balance > 0)...")
+    
+    while len(addresses) < max_borrowers:
         try:
             async with session.post(
                 AAVE_SUBGRAPH_URL,
@@ -241,18 +249,20 @@ async def fetch_borrowers_subgraph(session: aiohttp.ClientSession) -> list[str]:
                     "query": BORROWERS_QUERY,
                     "variables": {"lastId": last_id}
                 },
-                timeout=aiohttp.ClientTimeout(total=15),
+                timeout=aiohttp.ClientTimeout(total=20),
             ) as r:
                 if r.status != 200:
-                    log.warning("Subgraph returned status %d", r.status)
+                    log.warning("Subgraph returned status %d: %s", r.status, await r.text())
                     break
                 data = await r.json()
                 if "errors" in data:
-                    log.warning("Subgraph errors: %s", data["errors"])
+                    log.error("Subgraph errors: %s", json.dumps(data["errors"], indent=2))
+                    # If the filter failed, try to fallback to a simpler query or stop
                     break
                 
                 positions = data.get("data", {}).get("positions", [])
                 if not positions:
+                    log.info("Subgraph: reached end of results")
                     break
                 
                 for p in positions:
@@ -260,17 +270,20 @@ async def fetch_borrowers_subgraph(session: aiohttp.ClientSession) -> list[str]:
                     if p.get("account") and p["account"].get("id"):
                         addresses.add(p["account"]["id"])
                 
-                log.debug("Subgraph page fetched, total addresses so far: %d", len(addresses))
+                log.info("Subgraph: %d unique borrowers found...", len(addresses))
                 
                 # If we received less than 1000 items, we've reached the end
                 if len(positions) < 1000:
                     break
                     
+        except asyncio.TimeoutError:
+            log.warning("Subgraph timeout at id %s", last_id)
+            break
         except Exception as e:
             log.warning("Subgraph fetch failed: %s", e)
             break
             
-    log.info("Subgraph: found %d active borrowers", len(addresses))
+    log.info("Subgraph: Total unique borrowers for on-chain check: %d", len(addresses))
     return list(addresses)
 
 

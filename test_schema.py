@@ -1,13 +1,42 @@
 import requests
 import json
 import sys
+import aave_config
 
-url = "https://gateway.thegraph.com/api/273bca6dba3810c4dfbb103666609a43/subgraphs/id/4xyasjQeREe7PxnF6wVdobZvCw5mhoHZq3T7guRpuNPf"
-query = "{ __schema { queryType { fields { name } } } }"
-try:
-    r = requests.post(url, json={"query": query})
-    with open("schema_out.txt", "w") as f:
-        f.write(json.dumps(r.json(), indent=2))
-except Exception as e:
-    with open("schema_out.txt", "w") as f:
-        f.write(str(e))
+url = aave_config.AAVE_SUBGRAPH_URL
+
+# Step 1: Introspect the Position type to discover available fields
+introspect_query = """
+{
+  __type(name: "Position") {
+    fields {
+      name
+      type { name kind ofType { name } }
+    }
+  }
+}
+"""
+
+# Step 2: Also introspect Position_filter to see what where-clause fields exist
+filter_query = """
+{
+  __type(name: "Position_filter") {
+    inputFields {
+      name
+      type { name kind ofType { name } }
+    }
+  }
+}
+"""
+
+results = {}
+for label, q in [("Position_fields", introspect_query), ("Position_filter", filter_query)]:
+    try:
+        r = requests.post(url, json={"query": q}, timeout=15)
+        results[label] = r.json()
+    except Exception as e:
+        results[label] = str(e)
+
+with open("schema_introspect.json", "w") as f:
+    f.write(json.dumps(results, indent=2))
+print("Done — wrote schema_introspect.json")

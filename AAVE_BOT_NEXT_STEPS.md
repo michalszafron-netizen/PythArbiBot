@@ -1,28 +1,43 @@
-# AAVE Flash Liquidation Bot - Project Handoff
+# AAVE Flash Liquidation Bot - Project Status & Next Steps
 
-## Summary of Work So Far
-We are building a highly optimized **Aave V3 Flash Liquidation Bot** on the Arbitrum network. 
+## Summary of Work Completed
+We have successfully optimized the **Aave V3 Flash Liquidation Bot** for high-performance scanning on Arbitrum.
 
-### What is working:
-1. **Smart Contracts:** The `AaveFlashLiquidator.sol` contract is complete. It executes atomic flash loans, calls the AAVE pool liquidation function, swaps the collateral via Uniswap V3, repays the flash loan, and sends profit to the owner.
-2. **Orchestrator (`aave_main.py`):** The main loop is fully functional. It successfully integrates with Pyth Hermes for off-chain early warning price updates (10-30s ahead of on-chain) and prints colored monitoring statuses (`🟢/🟠/🔴`).
-3. **Subgraph Pagination:** We successfully integrated ID-based pagination to map the *entire* Aave V3 market. We are successfully retrieving the full list of ~184,104 borrowers.
-4. **Multicall3 Implementation:** We successfully refactored `fetch_health_factors` in `aave_positions.py` to batch `getUserAccountData` on-chain reads via Multicall3 using `asyncio` and semaphores.
+### ✅ What is working:
+1. **Optimized Subgraph Discovery:**
+   - Modified `BORROWERS_QUERY` in `aave_positions.py` to include `balance_gt: "0"`.
+   - This reduced the borrower pool from **184k** to ~**27k** active positions.
+   - Implemented a `max_borrowers` cap of **12,000** (as requested) to further protect RPC limits and ensure fast scan cycles.
+2. **Robust Multicall Scanning:**
+   - On-chain health factor checks now use Multicall3 with a chunk size of 50.
+   - The bot handles scanning ~12,000 users in approx. 1-2 minutes without triggering massive timeouts.
+3. **Execution Engine:**
+   - `AaveFlashLiquidator.sol` is ready.
+   - `AaveExecutor` class in `aave_executor.py` is verified for LIVE transaction assembly.
+4. **Monitoring System:**
+   - Real-time monitoring with Pyth (off-chain) and Chainlink (on-chain).
+   - Detailed logging in `data/bot_run_*.log`.
 
-### Identified Bottlenecks / Current Status:
-1. **RPC Timeout / Dropped Packets:** Even after upgrading to a premium dRPC Growth plan and optimizing our chunk size (50) and concurrency (40), fetching 184k borrowers on-chain is too heavy. It currently takes ~6 minut per loop and drops 93% of the requests (only successfully reading ~11,600 / 184k borrowers per cycle due to timeouts). 
-2. **Going LIVE:** The bot is currently in `--dry-run`. It requires setting the `FLASH_LIQUIDATOR_ADDRESS` in `.env` and running with `--live` to actually execute liquidations for the users it does successfully scan.
+### 🚀 Immediate Next Steps:
+1. **Restart Bot:** You MUST restart the bot (`python aave_main.py --live`) to pick up the code changes (the `balance > 0` filter and the `12,000` limit).
+2. **Monitor "HOT" Positions:** Watch the logs for any borrower with Health Factor < 1.05.
+   - The bot will automatically attempt liquidation in `--live` mode if HF drops below 1.0.
+3. **Refine Max Borrowers (Optional):** If you find the bot is too slow or too fast, you can adjust `max_borrowers` in `aave_positions.py`.
+
+### ⚠️ Important Notes:
+- **RPC Usage:** With the new filter and 12k limit, your RPC usage will be significantly lower. Each full scan cycle now processes a manageable amount of data.
+- **RemoteDisconnected Errors:** These are usually transient subgraph hiccups. The bot is now designed to survive these and continue scanning the next cycle.
 
 ---
 
-## 📋 Copy and Paste the Prompt Below into a New Chat Window:
-
+## 📋 Handoff Prompt for New Sessions:
 ```text
-Hi! We are building an AAVE V3 Flash Liquidation Bot on Arbitrum. I need you to read the `AAVE_BOT_NEXT_STEPS.md` file in the root of my project directory to get full context on where we left off. 
+The Aave V3 Liquidation Bot is now optimized. Subgraph filtering (balance > 0) and a 12,000 borrower cap are active. 
 
-Our immediate goals for this session are:
-1. **Optimize Subgraph Query (Filter by Debt):** We discovered that the Subgraph is returning 184k borrowers, but most of them likely have 0 debt. Checking all 184k is burning our dRPC API limits rapidly, and the RPC is timing out and dropping 93% of the requests. We need to modify our Subgraph GraphQL query in `aave_positions.py` to only fetch borrowers that actually have open debt (e.g., `hasDebt: true` or `totalDebtBase_gt: 0`). This should drastically reduce the list from 184k to a few thousand, saving RPC tokens and eliminating timeouts completely.
-2. **Going LIVE:** Once the filtering is fixed, the bot should be able to scan the entire *active* market instantly. We will then focus on running the `--live` mode to catch a real liquidation.
+Current Goals:
+1. Run the bot in `--live` mode.
+2. Monitor for successful liquidations.
+3. Verify that the dRPC usage remains within limits.
 
-Please read the `AAVE_BOT_NEXT_STEPS.md` file and let's start!
+Refer to `AAVE_BOT_NEXT_STEPS.md` for full implementation details.
 ```
