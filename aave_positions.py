@@ -34,6 +34,7 @@ from aave_config import (
     LOG_LEVEL,
     MIN_POSITION_USD,
     STABLECOINS,
+    MULTICALL3_ADDRESS,
 )
 
 logging.basicConfig(
@@ -132,6 +133,35 @@ ORACLE_ABI = [
     },
 ]
 
+MULTICALL3_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"name": "target", "type": "address"},
+                    {"name": "allowFailure", "type": "bool"},
+                    {"name": "callData", "type": "bytes"}
+                ],
+                "name": "calls",
+                "type": "tuple[]"
+            }
+        ],
+        "name": "aggregate3",
+        "outputs": [
+            {
+                "components": [
+                    {"name": "success", "type": "bool"},
+                    {"name": "returnData", "type": "bytes"}
+                ],
+                "name": "returnData",
+                "type": "tuple[]"
+            }
+        ],
+        "stateMutability": "payable",
+        "type": "function"
+    }
+]
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -182,13 +212,14 @@ class AaveBorrower:
 # ---------------------------------------------------------------------------
 
 BORROWERS_QUERY = """
-{
+query GetBorrowers($lastId: String!) {
   positions(
     first: 1000
-    where: { side: BORROWER }
+    where: { side: BORROWER, id_gt: $lastId }
     orderBy: id
     orderDirection: asc
   ) {
+    id
     account {
       id
     }
@@ -198,89 +229,150 @@ BORROWERS_QUERY = """
 
 # Query for users with active borrows — we then check HF on-chain
 async def fetch_borrowers_subgraph(session: aiohttp.ClientSession) -> list[str]:
-    """Fetch list of borrower addresses from AAVE subgraph."""
-    try:
-        async with session.post(
-            AAVE_SUBGRAPH_URL,
-            json={"query": BORROWERS_QUERY},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as r:
-            if r.status != 200:
-                log.warning("Subgraph returned status %d", r.status)
-                return []
-            data = await r.json()
-            if "errors" in data:
-                log.warning("Subgraph errors: %s", data["errors"])
-                return []
-            positions = data.get("data", {}).get("positions", [])
-            addresses = list({p.get("account", {}).get("id") for p in positions if p.get("account") and p["account"].get("id")})
-            log.info("Subgraph: found %d active borrowers", len(addresses))
-            return addresses
-    except Exception as e:
-        log.warning("Subgraph fetch failed: %s", e)
-        return []
+    """Fetch list of borrower addresses from AAVE subgraph using pagination."""
+    addresses = set()
+    last_id = ""
+    
+    while True:
+        try:
+            async with session.post(
+                AAVE_SUBGRAPH_URL,
+                json={
+                    "query": BORROWERS_QUERY,
+                    "variables": {"lastId": last_id}
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status != 200:
+                    log.warning("Subgraph returned status %d", r.status)
+                    break
+                data = await r.json()
+                if "errors" in data:
+                    log.warning("Subgraph errors: %s", data["errors"])
+                    break
+                
+                positions = data.get("data", {}).get("positions", [])
+                if not positions:
+                    break
+                
+                for p in positions:
+                    last_id = p["id"]
+                    if p.get("account") and p["account"].get("id"):
+                        addresses.add(p["account"]["id"])
+                
+                log.debug("Subgraph page fetched, total addresses so far: %d", len(addresses))
+                
+                # If we received less than 1000 items, we've reached the end
+                if len(positions) < 1000:
+                    break
+                    
+        except Exception as e:
+            log.warning("Subgraph fetch failed: %s", e)
+            break
+            
+    log.info("Subgraph: found %d active borrowers", len(addresses))
+    return list(addresses)
 
 
 # ---------------------------------------------------------------------------
 # Source 2: On-chain health factor reads (batch)
 # ---------------------------------------------------------------------------
 
+def chunked_iterable(iterable, size):
+    for i in range(0, len(iterable), size):
+        yield iterable[i:i + size]
+
 async def fetch_health_factors(
     w3: Web3, 
     addresses: list[str],
-    concurrency: int = 30,
+    concurrency: int = 40,
 ) -> list[AaveBorrower]:
     """
-    Read getUserAccountData for each address.
+    Read getUserAccountData for each address using Multicall3 in batches.
     Returns sorted list of AaveBorrower by health_factor ascending.
     """
-    pool = w3.eth.contract(
-        address=Web3.to_checksum_address(AAVE_V3_POOL), 
-        abi=POOL_ABI
+    pool_address = Web3.to_checksum_address(AAVE_V3_POOL)
+    pool = w3.eth.contract(address=pool_address, abi=POOL_ABI)
+    multicall = w3.eth.contract(
+        address=Web3.to_checksum_address(MULTICALL3_ADDRESS), 
+        abi=MULTICALL3_ABI
     )
+    
+    # 50 users per chunk ensures we stay well below computation/gas timeouts
+    chunk_size = 50
+    address_chunks = list(chunked_iterable(addresses, chunk_size))
+    
     semaphore = asyncio.Semaphore(concurrency)
     loop = asyncio.get_event_loop()
-
-    def _read_one(addr: str) -> Optional[AaveBorrower]:
+    
+    def _fetch_chunk(chunk: list[str]) -> list[AaveBorrower]:
+        calls = []
+        for addr in chunk:
+            try:
+                # Web3 v6: positional argument for fn_name
+                call_data = pool.encode_abi("getUserAccountData", args=[Web3.to_checksum_address(addr)])
+            except AttributeError:
+                # Web3 v5: keyword argument for fn_name
+                call_data = pool.encodeABI(fn_name="getUserAccountData", args=[Web3.to_checksum_address(addr)])
+            
+            calls.append((pool_address, True, call_data))
+            
         try:
-            result = pool.functions.getUserAccountData(
-                Web3.to_checksum_address(addr)
-            ).call()
-            
-            total_collateral = result[0] / 1e8  # AAVE base currency = 8 decimals (USD)
-            total_debt = result[1] / 1e8
-            liq_threshold = result[3] / 100       # bps → %
-            health_factor = result[5] / 1e18
-            
-            if total_debt < MIN_POSITION_USD:
-                return None
-            
-            return AaveBorrower(
-                address=addr,
-                health_factor=health_factor,
-                total_collateral_usd=total_collateral,
-                total_debt_usd=total_debt,
-                liquidation_threshold=liq_threshold,
-                timestamp=datetime.utcnow().isoformat(timespec="seconds"),
-                source="onchain",
-            )
+            results = multicall.functions.aggregate3(calls).call()
         except Exception as e:
-            log.debug("Failed to read HF for %s: %s", addr[:10], e)
-            return None
+            log.error("Multicall failed: %s", e)
+            return []
+            
+        borrowers = []
+        for addr, (success, return_data) in zip(chunk, results):
+            if not success or len(return_data) == 0:
+                continue
+                
+            try:
+                # Use w3.codec.decode (Web3 v6) or w3.codec.decode_abi (Web3 v5)
+                try:
+                    decoded = w3.codec.decode(["uint256", "uint256", "uint256", "uint256", "uint256", "uint256"], return_data)
+                except AttributeError:
+                    decoded = w3.codec.decode_abi(["uint256", "uint256", "uint256", "uint256", "uint256", "uint256"], return_data)
+                
+                total_collateral = decoded[0] / 1e8
+                total_debt = decoded[1] / 1e8
+                liq_threshold = decoded[3] / 100
+                health_factor = decoded[5] / 1e18
+                
+                if total_debt < MIN_POSITION_USD:
+                    continue
+                    
+                borrowers.append(AaveBorrower(
+                    address=addr,
+                    health_factor=health_factor,
+                    total_collateral_usd=total_collateral,
+                    total_debt_usd=total_debt,
+                    liquidation_threshold=liq_threshold,
+                    timestamp=datetime.utcnow().isoformat(timespec="seconds"),
+                    source="onchain"
+                ))
+            except Exception as e:
+                log.debug("Failed to decode for %s: %s", addr, e)
+                
+        return borrowers
 
-    async def _fetch_one(addr: str) -> Optional[AaveBorrower]:
+    async def _process_chunk(chunk: list[str]) -> list[AaveBorrower]:
         async with semaphore:
-            return await loop.run_in_executor(None, _read_one, addr)
+            return await loop.run_in_executor(None, _fetch_chunk, chunk)
 
     t0 = time.time()
-    results = await asyncio.gather(*[_fetch_one(a) for a in addresses])
+    results = await asyncio.gather(*[_process_chunk(chunk) for chunk in address_chunks])
     elapsed = time.time() - t0
     
-    borrowers = [r for r in results if r is not None]
+    borrowers = []
+    for r in results:
+        borrowers.extend(r)
+        
     borrowers.sort(key=lambda b: b.health_factor)
     
     log.info(
-        "On-chain: read %d/%d borrowers in %.1fs",
+        "On-chain (Multicall): read %d/%d borrowers in %.2fs",
         len(borrowers), len(addresses), elapsed
     )
     return borrowers

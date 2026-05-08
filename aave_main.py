@@ -137,7 +137,7 @@ class AaveOrchestrator:
         scan_interval: int = 60,
         dry_run: bool = True,
     ) -> None:
-        self.w3 = Web3(Web3.HTTPProvider(ARBITRUM_RPC_URL))
+        self.w3 = Web3(Web3.HTTPProvider(ARBITRUM_RPC_URL, request_kwargs={'timeout': 30}))
         if not self.w3.is_connected():
             raise RuntimeError(f"Cannot connect to RPC: {ARBITRUM_RPC_URL}")
         block = self.w3.eth.block_number
@@ -336,10 +336,10 @@ class AaveOrchestrator:
                 for b in hot[:5]:
                     self._check_pyth_early_warning(b)
 
-                # Log top 5 closest
-                for b in self.borrowers[:5]:
+                # Log top closest to liquidation for better perspective
+                for b in self.borrowers[:15]:
                     log.info(
-                        "  %s HF=%.4f | coll=$%.0f | debt=$%.0f | %s...",
+                        "%s HF=%.4f | coll=$%.0f | debt=$%.0f | %s...",
                         b.status,
                         b.health_factor,
                         b.total_collateral_usd,
