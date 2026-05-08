@@ -52,25 +52,22 @@ from aave_positions import (
 from aave_executor import AaveExecutor
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging & Data
 # ---------------------------------------------------------------------------
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-log_filename = os.path.join(DATA_DIR, f"bot_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt="%H:%M:%S",
-    force=True,  # Overrides any other logging setup
     handlers=[
-        logging.FileHandler(log_filename, encoding="utf-8"),
-        logging.StreamHandler()
+        logging.StreamHandler(),
+        logging.FileHandler("arbitrum_bot.log", encoding='utf-8')
     ]
 )
-log = logging.getLogger("aave_main")
+log = logging.getLogger("AaveBot.Arbitrum")
 
 
 # ---------------------------------------------------------------------------
@@ -191,11 +188,9 @@ class AaveOrchestrator:
         self.running = True
         self._stats = {
             "scans": 0,
-            "borrowers_tracked": 0,
-            "liquidatable_found": 0,
-            "hot_found": 0,
-            "executions_attempted": 0,
-            "executions_success": 0,
+            "known": 0,
+            "attempts": 0,
+            "successes": 0,
         }
 
     # ------------------------------------------------------------------ #
@@ -314,38 +309,38 @@ class AaveOrchestrator:
                 hot = [b for b in self.borrowers if b.is_hot]
                 warning = [b for b in self.borrowers if b.is_early_warning]
 
-                self._stats["borrowers_tracked"] = len(self.borrowers)
-                self._stats["liquidatable_found"] += len(liquidatable)
-                self._stats["hot_found"] += len(hot)
+                self._stats["known"] = len(self.borrowers)
+                
+                # UI TABLE (Professional style from Plasma)
+                print("\n" + "="*95)
+                header = f"ARBITRUM SCANS: {self._stats['scans']} | KNOWN: {self._stats['known']} | ATTEMPTS: {self._stats['attempts']} | SUCCESS: {self._stats['successes']}"
+                print(f"{header:^95}")
+                print("-" * 95)
+                print(f"{'UŻYTKOWNIK':<44} | {'HF':<8} | {'DŁUG (USD)':<12} | {'STATUS'}")
+                print("-" * 95)
 
-                log.info(
-                    "Scan #%d: %d borrowers | 🔴 %d liquidatable | 🟡 %d HOT | 🟠 %d warning [%.1fs]",
-                    self._stats["scans"],
-                    len(self.borrowers),
-                    len(liquidatable),
-                    len(hot),
-                    len(warning),
-                    elapsed,
-                )
+                # Sort by Health Factor (Riskiest first)
+                self.borrowers.sort(key=lambda b: b.health_factor)
+
+                for b in self.borrowers[:15]:
+                    status = "OK"
+                    if b.health_factor < 1.0: status = "!!! LIKWIDACJA !!!"
+                    elif b.health_factor < 1.05: status = "KRYTYCZNY"
+                    elif b.health_factor < 1.2: status = "ZAGROŻONY"
+                    
+                    print(f"{b.address:<44} | {b.health_factor:<8.4f} | {b.total_debt_usd:<12.2f} | {status}")
+
+                print("="*95 + "\n")
 
                 # Step 4: Process liquidatable positions
                 for b in liquidatable:
                     await self._process_candidate(b, "LIQUIDATABLE")
 
-                # Step 5: Log HOT positions (Pyth early warning)
-                for b in hot[:5]:
-                    self._check_pyth_early_warning(b)
-
-                # Log top closest to liquidation for better perspective
-                for b in self.borrowers[:15]:
-                    log.info(
-                        "%s HF=%.4f | coll=$%.0f | debt=$%.0f | %s...",
-                        b.status,
-                        b.health_factor,
-                        b.total_collateral_usd,
-                        b.total_debt_usd,
-                        b.address[:14],
-                    )
+                # Step 5: Early Warning Alerts (Pyth Delta check)
+                # Check top 5 most risky positions for predictive price moves
+                for b in self.borrowers[:5]:
+                    if b.health_factor < 1.15:
+                        self._check_pyth_early_warning(b)
 
             except Exception as e:
                 log.error("Scan error: %s", e, exc_info=True)
@@ -390,10 +385,10 @@ class AaveOrchestrator:
 
         # Execute if not dry-run
         if self.executor and not self.dry_run:
-            self._stats["executions_attempted"] += 1
+            self._stats["attempts"] += 1
             tx_hash = self.executor.execute_liquidation(borrower)
             if tx_hash:
-                self._stats["executions_success"] += 1
+                self._stats["successes"] += 1
                 action = f"EXECUTED:{tx_hash[:18]}"
                 log.warning("💰 LIQUIDATION EXECUTED: %s", tx_hash)
             else:
@@ -456,19 +451,16 @@ class AaveOrchestrator:
                         break
 
             log.info(
-                "\n=== AAVE BOT STATUS ===\n"
+                "\n=== AAVE ARBITRUM BOT STATUS ===\n"
                 "  Mode: %s\n"
                 "  Pyth feeds: %d  |  Chainlink prices: %d  |  Borrowers: %d\n"
-                "  Scans: %d  |  Liquidatable found: %d  |  HOT found: %d\n"
-                "  Executions: %d attempted / %d success\n"
+                "  Scans: %d  |  Attempts: %d  |  Successes: %d\n"
                 "  Price comparison (Pyth vs Chainlink):\n%s",
                 "DRY-RUN" if self.dry_run else "LIVE",
-                hermes_count, chainlink_count, self._stats["borrowers_tracked"],
+                hermes_count, chainlink_count, self._stats["known"],
                 self._stats["scans"],
-                self._stats["liquidatable_found"],
-                self._stats["hot_found"],
-                self._stats["executions_attempted"],
-                self._stats["executions_success"],
+                self._stats["attempts"],
+                self._stats["successes"],
                 "\n".join(comparisons) if comparisons else "  (waiting for data...)",
             )
             await asyncio.sleep(interval)
@@ -509,17 +501,15 @@ class AaveOrchestrator:
             if self.executor:
                 self.executor.print_stats()
             log.info(
-                "\n=== FINAL SUMMARY ===\n"
+                "\n=== FINAL SUMMARY (ARBITRUM) ===\n"
                 "  Scans: %d\n"
                 "  Borrowers tracked: %d\n"
-                "  Liquidatable found: %d\n"
                 "  Executions: %d/%d (success/attempted)\n"
                 "  Data saved to: %s",
                 self._stats["scans"],
-                self._stats["borrowers_tracked"],
-                self._stats["liquidatable_found"],
-                self._stats["executions_success"],
-                self._stats["executions_attempted"],
+                self._stats["known"],
+                self._stats["successes"],
+                self._stats["attempts"],
                 self.csv_path,
             )
 
