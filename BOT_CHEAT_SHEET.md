@@ -49,10 +49,37 @@ W tabelach konsolowych zobaczysz następujące statusy:
 *   `ZAGROŻONY` (HF < 1.20) – Widoczny w tabeli monitorowania.
 *   `OK` (HF > 1.20) – Bezpieczna pozycja.
 
+---
+
+## ⚡ Rozwiązywanie Problemów i Brak Akcji
+Jeśli bot wykonuje tysiące skanów (`SCANS`) i nic się nie dzieje:
+
+1.  **Brak zmienności (Volatility):** To najczęstsza przyczyna. Likwidacje zdarzają się przy gwałtownych ruchach (2-5% w kilka minut). Jeśli rynek stoi, HF dłużników nie drgnie.
+2.  **Duże Delty (Early Warning):** Jeśli widzisz np. `Δ = -8.00%` przez dłuższy czas, a bot nie likwiduje:
+    *   Może to być asset z "LST" (np. weETH, wstETH), gdzie Aave używa specjalnej wyceny (np. Ratio do ETH), a Pyth pokazuje czystą cenę rynkową.
+    *   To normalne — bot czeka, aż **on-chain Health Factor** spadnie poniżej 1.0.
+3.  **Sprawdzenie "czy żyje":**
+    *   Spójrz na kolumnę `HF` w tabeli. Jeśli cyfry po przecinku się zmieniają (np. z 1.0023 na 1.0024), to znaczy, że bot poprawnie pobiera dane on-chain i Multicall działa.
+    *   Sprawdź `arbitrum_bot.log` lub `plasma_bot.log` pod kątem błędów `[ERROR]`. Brak błędów = bot jest gotowy do strzału.
+
 ## 🛠️ Wspólne Elementy
 *   **Plik `.env`:** Tu trzymasz `PRIVATE_KEY` oraz adresy egzekutorów dla obu sieci.
 *   **Multicall:** Wszystkie boty Aave używają Multicall3 do błyskawicznego pobierania danych (oszczędność RPC).
 *   **Python Venv:** Zawsze upewnij się, że masz aktywny venv: `.\.venv\Scripts\activate`.
 
 ---
-*Ostatnia aktualizacja: 2026-05-08*
+
+## 🧪 Testowanie Konfiguracji (Self-Test)
+Jeśli chcesz mieć pewność, że Twoje klucze, RPC i kontrakty są poprawnie skonfigurowane, uruchom skrypty testowe:
+
+*   **Arbitrum:** `python test_executor_arbitrum.py`
+*   **Plasma:** `python test_executor_plasma.py`
+
+**Spodziewany wynik (SUKCES):**
+Jeśli zobaczysz komunikat `Position is healthy, HF >= 1`, oznacza to, że:
+1.  Skrypt poprawnie podpisał transakcję Twoim `PRIVATE_KEY`.
+2.  Kontrakt na blockchainie odebrał zapytanie i skontaktował się z AAVE.
+3.  Zostałeś rozpoznany jako właściciel (`owner`) kontraktu.
+
+---
+*Ostatnia aktualizacja: 2026-05-10*
