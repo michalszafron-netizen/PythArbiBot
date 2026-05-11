@@ -45,7 +45,7 @@ from aave_config import (
 )
 from aave_positions import (
     AaveBorrower,
-    fetch_borrower_details,
+    fetch_detailed_data,
     fetch_borrowers_subgraph,
     fetch_health_factors,
 )
@@ -302,37 +302,51 @@ class AaveOrchestrator:
                 self.borrowers = await fetch_health_factors(
                     self.w3, self.known_addresses
                 )
+                
+                # Step 3: Enrich TOP risk positions with detailed data (Liquidation Price, Assets)
+                # We do this for the top 15 most risky positions to keep UI updated
+                self.borrowers.sort(key=lambda b: b.health_factor)
+                hot_candidates = self.borrowers[:15]
+                
+                # We need current prices for the enrichment logic
+                # Map token address -> price for easy lookup
+                prices_by_symbol = {}
+                for addr, (sym, _, _) in AAVE_TOKENS.items():
+                    p = self.chainlink_prices.get(addr, 0)
+                    if p > 0: prices_by_symbol[sym] = p
+
+                await fetch_detailed_data(self.w3, hot_candidates, prices_by_symbol)
+                
                 elapsed = time.time() - t0
-
-                # Step 3: Categorize
-                liquidatable = [b for b in self.borrowers if b.is_liquidatable]
-                hot = [b for b in self.borrowers if b.is_hot]
-                warning = [b for b in self.borrowers if b.is_early_warning]
-
                 self._stats["known"] = len(self.borrowers)
                 
-                # UI TABLE (Professional style from Plasma)
-                print("\n" + "="*95)
-                header = f"ARBITRUM SCANS: {self._stats['scans']} | KNOWN: {self._stats['known']} | ATTEMPTS: {self._stats['attempts']} | SUCCESS: {self._stats['successes']}"
-                print(f"{header:^95}")
-                print("-" * 95)
-                print(f"{'UŻYTKOWNIK':<44} | {'HF':<8} | {'DŁUG (USD)':<12} | {'STATUS'}")
-                print("-" * 95)
+                # UI TABLE v2.0 (Professional Intelligence Dashboard)
+                print("\n" + "="*115)
+                header = f"ARBITRUM INTELLIGENCE: {self._stats['scans']} | KNOWN: {self._stats['known']} | ATTEMPTS: {self._stats['attempts']} | SUCCESS: {self._stats['successes']}"
+                print(f"{header:^115}")
+                print("-" * 115)
+                print(f"{'UŻYTKOWNIK':<20} | {'HF':<7} | {'TYP':<6} | {'DYSTANS':<8} | {'CENA LIQ':<12} | {'AKTYWA (C/D)':<18} | {'STATUS'}")
+                print("-" * 115)
 
-                # Sort by Health Factor (Riskiest first)
-                self.borrowers.sort(key=lambda b: b.health_factor)
-
-                for b in self.borrowers[:15]:
+                for b in hot_candidates:
                     status = "OK"
                     if b.health_factor < 1.0: status = "!!! LIKWIDACJA !!!"
                     elif b.health_factor < 1.05: status = "KRYTYCZNY"
-                    elif b.health_factor < 1.2: status = "ZAGROŻONY"
+                    elif b.health_factor < 1.15: status = "ZAGROŻONY"
                     
-                    print(f"{b.address:<44} | {b.health_factor:<8.4f} | {b.total_debt_usd:<12.2f} | {status}")
+                    dist_str = f"{b.dist_to_liq_pct:+.2f}%" if b.dist_to_liq_pct != 0 else "N/A"
+                    liq_price_str = f"${b.liq_price_estimate:,.2f}" if b.liq_price_estimate > 0 else "STABLE"
+                    assets_str = f"{b.main_collateral_symbol}/{b.main_debt_symbol}" if b.main_collateral_symbol else "CHECKING..."
+                    
+                    # Shorten address for UI
+                    short_addr = f"{b.address[:10]}...{b.address[-8:]}"
+                    
+                    print(f"{short_addr:<20} | {b.health_factor:<7.4f} | {b.pos_type:<6} | {dist_str:<8} | {liq_price_str:<12} | {assets_str:<18} | {status}")
 
-                print("="*95 + "\n")
+                print("="*115 + "\n")
 
                 # Step 4: Process liquidatable positions
+                liquidatable = [b for b in self.borrowers if b.health_factor < 1.0]
                 for b in liquidatable:
                     await self._process_candidate(b, "LIQUIDATABLE")
 
@@ -342,10 +356,26 @@ class AaveOrchestrator:
                     if b.health_factor < 1.15:
                         self._check_pyth_early_warning(b)
 
+                # Step 6: Dynamic Turbo Mode
+                # Speed up scan to 5s if someone is close to liquidation
+                is_turbo = any(
+                    b.health_factor < 1.05 or (b.dist_to_liq_pct != 0 and abs(b.dist_to_liq_pct) < 1.5)
+                    for b in hot_candidates
+                )
+                
+                current_interval = 5.0 if is_turbo else self.scan_interval
+                
+                if is_turbo:
+                    print(f"  >>> 🚀 [TURBO MODE ACTIVE] Next scan in {current_interval}s - Critical position detected!")
+                else:
+                    print(f"  >>> [Normal Mode] Next scan in {current_interval}s")
+                print("="*115 + "\n")
+
             except Exception as e:
                 log.error("Scan error: %s", e, exc_info=True)
+                current_interval = self.scan_interval
 
-            await asyncio.sleep(self.scan_interval)
+            await asyncio.sleep(current_interval)
 
     # ------------------------------------------------------------------ #
     # 4. Candidate processing and execution                               #
@@ -366,20 +396,21 @@ class AaveOrchestrator:
 
         # Get detailed per-asset breakdown
         try:
-            borrower = await asyncio.get_event_loop().run_in_executor(
-                None, fetch_borrower_details, self.w3, borrower
-            )
+            prices_by_symbol = {}
+            for addr, (sym, _, _) in AAVE_TOKENS.items():
+                p = self.chainlink_prices.get(addr, 0)
+                if p > 0: prices_by_symbol[sym] = p
+
+            await fetch_detailed_data(self.w3, [borrower], prices_by_symbol)
         except Exception as e:
             log.error("Failed to get details for %s: %s", borrower.address[:14], e)
             return
 
         # Log breakdown
-        if borrower.collateral_assets:
-            for _, sym, usd, amt, _ in borrower.collateral_assets:
-                log.info("    Collateral: %s = %.4f ($%.2f)", sym, amt, usd)
-        if borrower.debt_assets:
-            for _, sym, usd, amt, _ in borrower.debt_assets:
-                log.info("    Debt:       %s = %.4f ($%.2f)", sym, amt, usd)
+        if borrower.main_collateral_symbol:
+            log.info("    Main Collateral: %s ($%.2f)", borrower.main_collateral_symbol, borrower.main_collateral_usd)
+        if borrower.main_debt_symbol:
+            log.info("    Main Debt:       %s ($%.2f)", borrower.main_debt_symbol, borrower.main_debt_usd)
 
         action = "MONITOR"
 

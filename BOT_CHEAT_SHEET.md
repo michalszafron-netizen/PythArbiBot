@@ -64,22 +64,57 @@ Jeśli bot wykonuje tysiące skanów (`SCANS`) i nic się nie dzieje:
 
 ## 🛠️ Wspólne Elementy
 *   **Plik `.env`:** Tu trzymasz `PRIVATE_KEY` oraz adresy egzekutorów dla obu sieci.
-*   **Multicall:** Wszystkie boty Aave używają Multicall3 do błyskawicznego pobierania danych (oszczędność RPC).
-*   **Python Venv:** Zawsze upewnij się, że masz aktywny venv: `.\.venv\Scripts\activate`.
+*   **Multicall v3**: Błyskawiczne sprawdzanie tysięcy portfeli w jednej transakcji.
+*   **Dystans do likwidacji**: Wyliczany w czasie rzeczywistym dla każdego typu pozycji.
+*   **Dynamic Turbo Mode**: Automatyczne przyspieszenie skanu do 5s, gdy wykryto zagrożenie.
+*   **Python Venv**: Zawsze upewnij się, że masz aktywny venv: `.\.venv\Scripts\activate`.
 
 ---
 
-## 🧪 Testowanie Konfiguracji (Self-Test)
-Jeśli chcesz mieć pewność, że Twoje klucze, RPC i kontrakty są poprawnie skonfigurowane, uruchom skrypty testowe:
+## 🧪 Testowanie
 
-*   **Arbitrum:** `python test_executor_arbitrum.py`
-*   **Plasma:** `python test_executor_plasma.py`
+## 📊 Jak czytać Panel Intelligence (v2.0)
 
-**Spodziewany wynik (SUKCES):**
-Jeśli zobaczysz komunikat `Position is healthy, HF >= 1`, oznacza to, że:
-1.  Skrypt poprawnie podpisał transakcję Twoim `PRIVATE_KEY`.
-2.  Kontrakt na blockchainie odebrał zapytanie i skontaktował się z AAVE.
-3.  Zostałeś rozpoznany jako właściciel (`owner`) kontraktu.
+Nowy dashboard dostarcza danych analitycznych w czasie rzeczywistym:
+
+| Kolumna | Znaczenie | Dlaczego to ważne? |
+| :--- | :--- | :--- |
+| **TYP** | LONG, SHORT, LOOP | Mówi nam, na co gra użytkownik. |
+| **DYSTANS** | % do likwidacji | Pokazuje "zapas" bezpieczeństwa. Jeśli widzisz < 1%, bądź gotowy! |
+| **CENA LIQ** | Cena punktu zero | Konkretna cena aktywa, przy której pozycja wybucha. |
+| **AKTYWA** | Collateral / Debt | Widzisz np. `weETH/WETH`. To jest Twój cel przy depegu. |
+
+### 🔍 Strategia "Depeg / Loop"
+Większość pozycji na Arbitrum to `weETH/WETH` (LOOP).
+- **Zasada**: Użytkownik liczy na staking yield, my liczymy na to, że `weETH` spadnie względem `WETH` o te ułamki procenta.
+- **Kiedy to zadziała?**: Podczas gwałtownych ruchów ETH, kiedy płynność weETH maleje.
 
 ---
+
+## 🚀 Komendy START (Tryb Produkcyjny)
+
+Zawsze zaczynaj od `dry-run`, a gdy rynek zacznie się ruszać, przełącz na `--live`.
+
+### Arbitrum One
+```powershell
+# Tryb podglądu (Bezpieczny)
+python aave_main.py --dry-run --scan-interval 30
+
+# Tryb LIVE (Realne transakcje)
+python aave_main.py --live --scan-interval 15
+```
+
+### Plasma (wkrótce)
+*Obecnie testujemy dashboard na Arbitrum. Po potwierdzeniu stabilności, wdrożymy te same metryki dla Plazmy.*
+
+---
+
+## 🛠️ Szybka diagnostyka przed LIVE
+Zanim odpalsz tryb `--live`, wykonaj te dwa testy:
+
+1. **Test kontraktu (Arbitrum)**: `python test_executor_arbitrum.py`
+   - Powinieneś zobaczyć błąd `HF > 1` – to znak, że połączenie z kontraktem działa!
+2. **Test analizy**: `python aave_positions.py`
+   - Sprawdź, czy widzisz tabelkę z "Intelligence".
+
 *Ostatnia aktualizacja: 2026-05-10*

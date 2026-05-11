@@ -71,13 +71,13 @@ interface IERC20 {
     function allowance(address owner, address spender) external view returns (uint256);
 }
 
+// Router02 interface (no deadline field — used by native Plasma DEX)
 interface ISwapRouter {
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
         uint24 fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
@@ -237,9 +237,8 @@ contract AaveFlashLiquidator {
                     tokenOut: debtAsset,
                     fee: swapPoolFee,
                     recipient: address(this),
-                    deadline: block.timestamp + 300,
                     amountIn: collateralReceived,
-                    amountOutMinimum: amountNeeded,  // at minimum, we need enough to repay
+                    amountOutMinimum: amountNeeded,
                     sqrtPriceLimitX96: 0
                 });
 

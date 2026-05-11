@@ -177,13 +177,20 @@ class AaveBorrower:
     total_debt_usd: float
     liquidation_threshold: float  # weighted average, in %
     
-    # Details per asset (filled on-demand for actionable candidates)
-    collateral_assets: list = field(default_factory=list)  # [(token_addr, symbol, amount_usd)]
-    debt_assets: list = field(default_factory=list)          # [(token_addr, symbol, amount_usd)]
+    # Details per asset (filled for candidates < HF 1.1)
+    main_collateral_symbol: str = "???"
+    main_debt_symbol: str = "???"
+    main_collateral_usd: float = 0.0
+    main_debt_usd: float = 0.0
+    
+    # Calculated metrics
+    liq_price_estimate: float = 0.0
+    dist_to_liq_pct: float = 0.0 # in %
+    pos_type: str = "UNKNOWN"    # LONG, SHORT, LOOP
     
     # Tracking
     timestamp: str = ""
-    source: str = "subgraph"  # or "onchain"
+    source: str = "subgraph"
 
     @property
     def is_liquidatable(self) -> bool:
@@ -198,14 +205,55 @@ class AaveBorrower:
         return HF_MONITOR <= self.health_factor < HF_EARLY_WARNING
 
     @property
-    def status(self) -> str:
-        if self.is_liquidatable:
-            return "🔴 LIQUIDATABLE"
-        elif self.is_hot:
-            return "🟡 HOT"
-        elif self.is_early_warning:
-            return "🟠 WARNING"
-        return "🟢 SAFE"
+    def status_label(self) -> str:
+        if self.is_liquidatable: return "LIKWIDACJA"
+        if self.is_hot: return "KRYTYCZNY"
+        if self.is_early_warning: return "ZAGROŻONY"
+        return "OK"
+    
+    def calculate_metrics(self, current_prices: dict):
+        """Calculates liquidation price and distance based on the most volatile asset."""
+        if not self.main_debt_symbol or not self.main_collateral_symbol:
+            return
+
+        # Determine Position Type
+        is_coll_stable = self.main_collateral_symbol in STABLECOINS
+        is_debt_stable = self.main_debt_symbol in STABLECOINS
+        
+        if not is_coll_stable and is_debt_stable:
+            self.pos_type = f"LONG {self.main_collateral_symbol}"
+        elif is_coll_stable and not is_debt_stable:
+            self.pos_type = f"SHORT {self.main_debt_symbol}"
+        elif not is_coll_stable and not is_debt_stable:
+            self.pos_type = "HEDGE/LOOP"
+        else:
+            self.pos_type = "STABLE-STABLE"
+ 
+        # Simple Liq Price Estimate (simplified model)
+        # HF = (Collateral * Price * LT) / (Debt * Price)
+        # We find Price where HF = 1.0
+        
+        try:
+            # For LONG or LOOP, we track the Collateral price drop
+            # For SHORT, we track the Debt price increase
+            is_short = "SHORT" in self.pos_type
+            tracking_symbol = self.main_debt_symbol if is_short else self.main_collateral_symbol
+            current_price = current_prices.get(tracking_symbol, 0)
+            
+            if current_price <= 0: return
+
+            if not is_short:
+                # LONG or LOOP: Price where HF=1.0 (Collateral drops)
+                # 1.0 = (CollValue * (P_new/P_old) * LT_avg) / DebtValue
+                self.liq_price_estimate = (self.total_debt_usd * current_price) / (self.total_collateral_usd * (self.liquidation_threshold/100))
+                self.dist_to_liq_pct = ((self.liq_price_estimate / current_price) - 1) * 100
+            else:
+                # SHORT: Price where HF=1.0 (Debt rises)
+                # 1.0 = (CollValue * LT_avg) / (DebtValue * (P_new/P_old))
+                self.liq_price_estimate = (self.total_collateral_usd * (self.liquidation_threshold/100) * current_price) / self.total_debt_usd
+                self.dist_to_liq_pct = ((self.liq_price_estimate / current_price) - 1) * 100
+        except:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -395,74 +443,96 @@ async def fetch_health_factors(
 # Detailed position data (for actionable candidates only)
 # ---------------------------------------------------------------------------
 
-def fetch_borrower_details(w3: Web3, borrower: AaveBorrower) -> AaveBorrower:
-    """
-    Enrich borrower with per-asset collateral and debt breakdown.
-    Only call this for positions we want to actually liquidate.
-    """
-    pool = w3.eth.contract(
-        address=Web3.to_checksum_address(AAVE_V3_POOL),
-        abi=POOL_ABI
-    )
-    data_provider = w3.eth.contract(
-        address=Web3.to_checksum_address(AAVE_V3_DATA_PROVIDER),
-        abi=DATA_PROVIDER_ABI,
-    )
-    oracle = w3.eth.contract(
-        address=Web3.to_checksum_address(AAVE_V3_ORACLE),
-        abi=ORACLE_ABI,
-    )
+# ---------------------------------------------------------------------------
+# Detailed position data (Enhanced for v2.0)
+# ---------------------------------------------------------------------------
 
+async def fetch_detailed_data(w3: Web3, borrowers: list[AaveBorrower], current_prices: dict):
+    """
+    Enriches 'hot' borrowers with asset details, position type and liq prices.
+    Uses Multicall3 for efficiency.
+    """
+    if not borrowers: return borrowers
+
+    pool_address = Web3.to_checksum_address(AAVE_V3_POOL)
+    data_provider_address = Web3.to_checksum_address(AAVE_V3_DATA_PROVIDER)
+    
+    pool = w3.eth.contract(address=pool_address, abi=POOL_ABI)
+    data_provider = w3.eth.contract(address=data_provider_address, abi=DATA_PROVIDER_ABI)
+    multicall = w3.eth.contract(address=Web3.to_checksum_address(MULTICALL3_ADDRESS), abi=MULTICALL3_ABI)
+
+    # 1. Get all reserves to map indices
     try:
         reserves = pool.functions.getReservesList().call()
+        # Map reserve index -> address
+        reserve_map = {i: addr for i, addr in enumerate(reserves)}
     except Exception as e:
         log.error("Failed to get reserves list: %s", e)
-        return borrower
+        return borrowers
 
-    user_addr = Web3.to_checksum_address(borrower.address)
-    collateral_list = []
-    debt_list = []
-
-    for reserve in reserves:
-        reserve_lower = reserve.lower()
-        token_info = AAVE_TOKENS.get(reserve)
-        if token_info is None:
-            # Try case-insensitive match
-            for k, v in AAVE_TOKENS.items():
-                if k.lower() == reserve_lower:
-                    token_info = v
-                    break
+    # 2. For each borrower, we need their configuration (bitmask)
+    # We'll add getUserConfiguration to POOL_ABI if missing, or use DataProvider
+    # Actually, let's just use DataProvider.getUserReserveData for a set of common tokens 
+    # OR get individual user configuration.
+    
+    # Simpler approach for v2: Check top 5-7 most common tokens for everyone in 'hot' list
+    common_tokens = [addr for addr in AAVE_TOKENS.keys()] 
+    
+    for b in borrowers:
+        user_addr = Web3.to_checksum_address(b.address)
+        calls = []
+        for token in common_tokens:
+            token_addr = Web3.to_checksum_address(token)
+            call_data = data_provider.encode_abi("getUserReserveData", args=[token_addr, user_addr])
+            calls.append((data_provider_address, True, call_data))
         
-        symbol = token_info[0] if token_info else reserve[:8]
-        decimals = token_info[1] if token_info else 18
-
         try:
-            user_data = data_provider.functions.getUserReserveData(reserve, user_addr).call()
-            a_token_balance = user_data[0]   # collateral
-            variable_debt = user_data[2]      # variable debt
+            results = multicall.functions.aggregate3(calls).call()
             
-            if a_token_balance == 0 and variable_debt == 0:
-                continue
-
-            # Get price from AAVE oracle
-            price = oracle.functions.getAssetPrice(reserve).call() / 1e8
+            best_coll_val = 0
+            best_debt_val = 0
             
-            if a_token_balance > 0:
-                amount = a_token_balance / (10 ** decimals)
-                usd_value = amount * price
-                collateral_list.append((reserve, symbol, usd_value, amount, decimals))
+            for i, (success, return_data) in enumerate(results):
+                if not success: continue
+                
+                decoded = w3.codec.decode(["uint256", "uint256", "uint256", "uint256", "uint256", "uint256", "uint256", "uint40", "bool"], return_data)
+                
+                a_bal = decoded[0]
+                v_debt = decoded[2]
+                
+                token_addr = common_tokens[i]
+                token_info = AAVE_TOKENS.get(token_addr)
+                if token_info:
+                    symbol = token_info[0]
+                    decimals = token_info[1]
+                else:
+                    # Fallback for unknown tokens
+                    symbol = token_addr[:6]
+                    decimals = 18 
+                
+                price = current_prices.get(symbol, 0)
+                
+                if a_bal > 0:
+                    val = (a_bal / 10**decimals) * price
+                    if val > best_coll_val:
+                        best_coll_val = val
+                        b.main_collateral_symbol = symbol
+                        b.main_collateral_usd = val
+                
+                if v_debt > 0:
+                    val = (v_debt / 10**decimals) * price
+                    if val > best_debt_val:
+                        best_debt_val = val
+                        b.main_debt_symbol = symbol
+                        b.main_debt_usd = val
             
-            if variable_debt > 0:
-                amount = variable_debt / (10 ** decimals)
-                usd_value = amount * price
-                debt_list.append((reserve, symbol, usd_value, amount, decimals))
-
+            # Now calculate metrics for the borrower
+            b.calculate_metrics(current_prices)
+            
         except Exception as e:
-            log.debug("Failed to read reserve %s for %s: %s", symbol, borrower.address[:10], e)
-
-    borrower.collateral_assets = collateral_list
-    borrower.debt_assets = debt_list
-    return borrower
+            log.debug("Detail fetch failed for %s: %s", b.address, e)
+            
+    return borrowers
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +552,7 @@ def print_borrowers(borrowers: list[AaveBorrower], title: str, limit: int = 25) 
             f"${b.total_collateral_usd:>13,.0f} "
             f"${b.total_debt_usd:>13,.0f} "
             f"{b.liquidation_threshold:>7.1f}% "
-            f"{b.status:16s} "
+            f"{b.status_label:16s} "
             f"{b.address[:14]}..."
         )
 
@@ -500,7 +570,7 @@ def save_borrowers_csv(borrowers: list[AaveBorrower]) -> str:
             writer.writerow([
                 b.address, f"{b.health_factor:.6f}",
                 f"{b.total_collateral_usd:.2f}", f"{b.total_debt_usd:.2f}",
-                f"{b.liquidation_threshold:.2f}", b.status, b.timestamp,
+                f"{b.liquidation_threshold:.2f}", b.status_label, b.timestamp,
             ])
     return path
 
@@ -540,19 +610,27 @@ async def run_analysis() -> None:
     print(f"  🟡 HOT (HF 1.0-1.05)   : {len(hot)}")
     print(f"  🟠 Warning (HF 1.05-1.1): {len(warning)}")
 
-    if liquidatable:
-        print_borrowers(liquidatable, "🔴 LIQUIDATABLE POSITIONS:")
+    if liquidatable or hot:
+        candidates = (liquidatable + hot)[:5]
         # Get detailed breakdown for top candidates
-        for b in liquidatable[:3]:
-            b = fetch_borrower_details(w3, b)
-            if b.collateral_assets:
-                print(f"\n    Collateral breakdown for {b.address[:14]}...")
-                for _, sym, usd, amt, _ in b.collateral_assets:
-                    print(f"      {sym:8s}: {amt:>14.6f}  (${usd:>12,.2f})")
-            if b.debt_assets:
-                print(f"    Debt breakdown:")
-                for _, sym, usd, amt, _ in b.debt_assets:
-                    print(f"      {sym:8s}: {amt:>14.6f}  (${usd:>12,.2f})")
+        # We need prices for calculate_metrics
+        prices = {}
+        # Simple fallback for run_analysis: fetch some basic prices
+        oracle = w3.eth.contract(address=Web3.to_checksum_address(AAVE_V3_ORACLE), abi=ORACLE_ABI)
+        for addr, (sym, _, _) in AAVE_TOKENS.items():
+            try:
+                prices[sym] = oracle.functions.getAssetPrice(Web3.to_checksum_address(addr)).call() / 1e8
+            except: pass
+
+        await fetch_detailed_data(w3, candidates, prices)
+        
+        print("\nDETAILED ANALYSIS OF TOP RISKS:")
+        for b in candidates:
+            dist_str = f"{b.dist_to_liq_pct:+.2f}%" if b.dist_to_liq_pct != 0 else "N/A"
+            liq_price = f"${b.liq_price_estimate:,.2f}" if b.liq_price_estimate > 0 else "STABLE"
+            print(f"  {b.address[:14]}... | HF: {b.health_factor:.4f} | Type: {b.pos_type:<10} | Dist: {dist_str:<8} | Liq: {liq_price}")
+            print(f"    Collateral: {b.main_collateral_symbol} (${b.main_collateral_usd:,.2f})")
+            print(f"    Debt:       {b.main_debt_symbol} (${b.main_debt_usd:,.2f})")
 
     if hot:
         print_borrowers(hot, "🟡 HOT — HF between 1.0 and 1.05:")
